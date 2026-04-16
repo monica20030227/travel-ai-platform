@@ -1,12 +1,26 @@
-﻿
 import random
+from datetime import datetime
 from typing import Dict, List, Tuple
 
+import gspread
 import pandas as pd
 import streamlit as st
+from google.oauth2.service_account import Credentials
 
 
 st.set_page_config(page_title="國內旅遊推薦平台", page_icon="🧭", layout="wide")
+
+
+# =========================
+# 基本設定
+# =========================
+# 改成你自己的 Google Sheet 網址
+SHEET_URL = "https://docs.google.com/spreadsheets/d/1n5AwsF_eLQluhVpYrj6YhU27gOOsDYK0KrBuz7AfAeA/edit?gid=0#gid=0"
+
+SHEET_HEADERS = [
+    "timestamp", "name", "travel_style", "budget_level",
+    *[f"q{i}" for i in range(1, 26)]
+]
 
 
 # =========================
@@ -178,13 +192,9 @@ DESTINATIONS = [
 # 工具函式
 # =========================
 
-def init_state():
-    if "members" not in st.session_state:
-        st.session_state.members = []
-    if "member_counter" not in st.session_state:
-        st.session_state.member_counter = 1
+def init_state() -> None:
     if "draft_name" not in st.session_state:
-        st.session_state.draft_name = f"朋友{st.session_state.member_counter}"
+        st.session_state.draft_name = ""
     if "draft_travel_style" not in st.session_state:
         st.session_state.draft_travel_style = "朋友"
     if "draft_budget_level" not in st.session_state:
@@ -197,8 +207,8 @@ def init_state():
         st.session_state.success_message = ""
 
 
-def reset_draft():
-    st.session_state.draft_name = f"朋友{st.session_state.member_counter}"
+def reset_draft() -> None:
+    st.session_state.draft_name = ""
     st.session_state.draft_travel_style = "朋友"
     st.session_state.draft_budget_level = "中等"
     st.session_state.draft_answers = [3] * len(QUESTIONS)
@@ -206,6 +216,83 @@ def reset_draft():
         key = f"q_{idx}"
         if key in st.session_state:
             del st.session_state[key]
+
+
+@st.cache_resource
+def get_gsheet():
+    scope = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    creds = Credentials.from_service_account_info(
+        st.secrets["gcp_service_account"],
+        scopes=scope,
+    )
+    client = gspread.authorize(creds)
+    return client.open_by_url(SHEET_URL).sheet1
+
+
+def ensure_sheet_headers(sheet) -> None:
+    values = sheet.get_all_values()
+    if not values:
+        sheet.append_row(SHEET_HEADERS)
+        return
+
+    first_row = values[0]
+    if len(first_row) < len(SHEET_HEADERS):
+        sheet.clear()
+        sheet.append_row(SHEET_HEADERS)
+        if len(values) > 1:
+            for row in values[1:]:
+                normalized = row[:len(SHEET_HEADERS)] + [""] * max(0, len(SHEET_HEADERS) - len(row))
+                sheet.append_row(normalized)
+
+
+def get_current_answers() -> List[int]:
+    answers = []
+    for idx in range(len(QUESTIONS)):
+        answers.append(int(st.session_state.get(f"q_{idx}", st.session_state.draft_answers[idx])))
+    st.session_state.draft_answers = answers[:]
+    return answers
+
+
+def save_response_to_gsheet(sheet, name: str, travel_style: str, budget_level: str, answers: List[int]) -> None:
+    row = [
+        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        name,
+        travel_style,
+        budget_level,
+        *answers,
+    ]
+    sheet.append_row(row)
+
+
+def load_members_from_gsheet(sheet) -> List[Dict]:
+    records = sheet.get_all_records()
+    members = []
+
+    for idx, row in enumerate(records):
+        try:
+            answers = [int(row.get(f"q{i}", 3) or 3) for i in range(1, 26)]
+            profile = average_dimension_scores(answers)
+            persona = persona_label(profile)
+            recs = recommend_destinations(profile, top_n=3)
+            members.append({
+                "row_id": idx + 2,
+                "timestamp": str(row.get("timestamp", "")),
+                "name": str(row.get("name", "")).strip() or f"未命名_{idx+1}",
+                "travel_style": str(row.get("travel_style", "朋友")),
+                "budget_level": str(row.get("budget_level", "中等")),
+                "answers": answers,
+                "profile": profile,
+                "persona": persona,
+                "recommendations": recs,
+            })
+        except Exception:
+            continue
+
+    members.sort(key=lambda x: x["timestamp"], reverse=True)
+    return members
 
 
 def average_dimension_scores(answers: List[int]) -> Dict[str, float]:
@@ -257,7 +344,7 @@ def destination_match_score(profile: Dict[str, float], dest: Dict) -> float:
         score += (5 - abs(profile[key] - d.get(key, 3))) * weight * 20
 
     top_dims = sorted(profile.items(), key=lambda x: x[1], reverse=True)[:2]
-    bonus = 0
+    bonus = 0.0
     for dim, value in top_dims:
         bonus += d.get(dim, 3) * value * 0.8
     return round(score + bonus, 2)
@@ -282,24 +369,22 @@ def spot_match_score(profile: Dict[str, float], spot: Dict) -> float:
 def build_dynamic_itinerary(profile: Dict[str, float], destination: Dict, seed: int = 42) -> Dict[str, List[Dict]]:
     random.seed(seed)
 
-    spots = destination["spots"][:]
-    scored_spots = [(spot, spot_match_score(profile, spot)) for spot in spots]
+    scored_spots = [(spot, spot_match_score(profile, spot)) for spot in destination["spots"]]
     scored_spots.sort(key=lambda x: x[1], reverse=True)
 
     selected = []
     used_types = set()
-
-    for spot, s in scored_spots:
+    for spot, score in scored_spots:
         if spot["type"] not in used_types or len(selected) < 3:
-            selected.append({**spot, "fit_score": s})
+            selected.append({**spot, "fit_score": score})
             used_types.add(spot["type"])
         if len(selected) >= 6:
             break
 
     if len(selected) < 6:
-        for spot, s in scored_spots:
+        for spot, score in scored_spots:
             if spot["name"] not in [x["name"] for x in selected]:
-                selected.append({**spot, "fit_score": s})
+                selected.append({**spot, "fit_score": score})
             if len(selected) >= 6:
                 break
 
@@ -349,7 +434,7 @@ def itinerary_comment(profile: Dict[str, float], itinerary: Dict[str, List[Dict]
 def radar_df(profile: Dict[str, float]) -> pd.DataFrame:
     return pd.DataFrame({
         "構面": [DIMENSION_LABELS[d] for d in DIMENSIONS],
-        "分數": [profile[d] for d in DIMENSIONS]
+        "分數": [profile[d] for d in DIMENSIONS],
     })
 
 
@@ -363,16 +448,22 @@ def group_recommendation(members: List[Dict], top_n: int = 3) -> List[Tuple[Dict
         avg_score = sum(per_member) / len(per_member)
         spread = max(per_member) - min(per_member) if len(per_member) > 1 else 0
         final_score = avg_score - (spread * 0.15)
-        agg_scores.append((dest, round(final_score, 2), per_member))
+        agg_scores.append((dest, round(final_score, 2)))
 
     agg_scores.sort(key=lambda x: x[1], reverse=True)
-    return [(dest, score) for dest, score, _ in agg_scores[:top_n]]
+    return agg_scores[:top_n]
 
 
 def to_download_rows(members: List[Dict]) -> pd.DataFrame:
     rows = []
     for m in members:
-        row = {"姓名": m["name"], "人格類型": m["persona"]}
+        row = {
+            "填答時間": m["timestamp"],
+            "姓名": m["name"],
+            "旅伴型態": m["travel_style"],
+            "預算感受": m["budget_level"],
+            "人格類型": m["persona"],
+        }
         for dim in DIMENSIONS:
             row[DIMENSION_LABELS[dim]] = m["profile"][dim]
         for idx, rec in enumerate(m["recommendations"], start=1):
@@ -382,38 +473,31 @@ def to_download_rows(members: List[Dict]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def get_current_answers() -> List[int]:
-    answers = []
-    for idx in range(len(QUESTIONS)):
-        answers.append(int(st.session_state.get(f"q_{idx}", st.session_state.draft_answers[idx])))
-    st.session_state.draft_answers = answers[:]
-    return answers
-
-
-def add_current_member():
+def submit_current_response(sheet) -> None:
     name = st.session_state.draft_name.strip()
     if not name:
         st.warning("請先輸入姓名或暱稱。")
         return
 
     answers = get_current_answers()
-    profile = average_dimension_scores(answers)
-    persona = persona_label(profile)
-    recs = recommend_destinations(profile, top_n=3)
-
-    st.session_state.members.append({
-        "name": name,
-        "travel_style": st.session_state.draft_travel_style,
-        "budget_level": st.session_state.draft_budget_level,
-        "answers": answers,
-        "profile": profile,
-        "persona": persona,
-        "recommendations": recs
-    })
-    st.session_state.member_counter += 1
-    st.session_state.success_message = f"已完成 {name} 的分析！人格類型：{persona}"
+    save_response_to_gsheet(
+        sheet=sheet,
+        name=name,
+        travel_style=st.session_state.draft_travel_style,
+        budget_level=st.session_state.draft_budget_level,
+        answers=answers,
+    )
+    st.session_state.success_message = f"已成功送出 {name} 的填答資料！"
     st.session_state.reset_draft_pending = True
+    st.cache_data.clear()
     st.rerun()
+
+
+@st.cache_data(ttl=5)
+def get_members_data() -> List[Dict]:
+    sheet = get_gsheet()
+    ensure_sheet_headers(sheet)
+    return load_members_from_gsheet(sheet)
 
 
 # =========================
@@ -427,7 +511,11 @@ if st.session_state.reset_draft_pending:
     st.session_state.reset_draft_pending = False
 
 st.title("🧭 國內旅遊人格 AI 推薦平台")
-st.caption("多人問卷蒐集 → 個人化推薦 → 動態兩天一夜行程 → 全體綜合推薦")
+st.caption("多人手機填答 → 自動寫入 Google Sheets → 個人推薦 → 動態兩天一夜行程 → 全體綜合推薦")
+
+sheet = get_gsheet()
+ensure_sheet_headers(sheet)
+members = get_members_data()
 
 if st.session_state.success_message:
     st.success(st.session_state.success_message)
@@ -436,45 +524,40 @@ if st.session_state.success_message:
 with st.sidebar:
     st.header("平台說明")
     st.write(
-        "這個版本採用混合式推薦：\n"
-        "1. 問卷轉成旅遊人格分數\n"
-        "2. 依個人偏好動態計算目的地匹配度\n"
-        "3. 從景點資料庫中動態挑選兩天一夜行程\n"
-        "4. 最後整合朋友們的結果，輸出綜合前三推薦"
+        "這個版本已改成 Google Sheets 雲端儲存：\n"
+        "1. 每位朋友都可用自己的手機填答\n"
+        "2. 送出後會自動寫入同一份試算表\n"
+        "3. 平台會直接從雲端資料計算個人與群體推薦\n"
+        "4. 同一個網址即可收集所有人資料"
     )
     st.markdown("---")
-    st.subheader("目前已加入成員")
-    if st.session_state.members:
-        for idx, member in enumerate(st.session_state.members, start=1):
-            st.write(f"{idx}. {member['name']}｜{member['persona']}")
-    else:
-        st.caption("尚未加入任何朋友")
-
-    if st.button("清除所有成員資料"):
-        st.session_state.members = []
-        st.session_state.member_counter = 1
-        st.session_state.success_message = ""
-        st.session_state.reset_draft_pending = True
+    st.metric("目前雲端填答筆數", len(members))
+    if st.button("重新讀取雲端資料", use_container_width=True):
+        st.cache_data.clear()
         st.rerun()
 
+    st.markdown("---")
+    st.subheader("最近填答名單")
+    if members:
+        for member in members[:8]:
+            st.write(f"- {member['name']}｜{member['persona']}")
+    else:
+        st.caption("目前尚無資料")
 
-tab1, tab2, tab3 = st.tabs(["新增朋友問卷", "個人推薦結果", "群體綜合分析"])
+
+tab1, tab2, tab3 = st.tabs(["填寫問卷", "個人推薦結果", "群體綜合分析"])
 
 with tab1:
-    st.subheader("新增一位朋友的旅遊問卷")
-    st.info("先輸入姓名，再直接往下填所有問題；只有按下最下面的「加入這位朋友並分析」才會真的送出。")
+    st.subheader("填寫旅遊問卷")
+    st.info("先輸入姓名，再往下填所有問題；只有按下最下面的「送出問卷並分析」才會真的寫入 Google Sheets。")
 
-    name_col1, name_col2 = st.columns([1.4, 1])
-    with name_col1:
-        st.text_input(
-            "姓名 / 暱稱",
-            key="draft_name",
-            placeholder=f"例如：朋友{st.session_state.member_counter}",
-        )
-    with name_col2:
+    col_name, col_hint = st.columns([1.4, 1])
+    with col_name:
+        st.text_input("姓名 / 暱稱", key="draft_name", placeholder="例如：小美")
+    with col_hint:
         st.write("")
         st.write("")
-        st.caption("輸入名字後直接繼續往下填即可，不會立刻送出")
+        st.caption("輸入名字後直接往下填，不會立刻送出")
 
     col1, col2 = st.columns(2)
     with col1:
@@ -485,21 +568,21 @@ with tab1:
     st.markdown("### 請依 1～5 分回答")
     st.caption("1 = 非常不同意，5 = 非常同意")
 
-    for idx, (_, q) in enumerate(QUESTIONS):
+    for idx, (_, question) in enumerate(QUESTIONS):
         default_value = st.session_state.draft_answers[idx]
         st.slider(
-            f"{idx + 1}. {q}",
+            f"{idx + 1}. {question}",
             min_value=1,
             max_value=5,
             value=default_value,
             key=f"q_{idx}",
-            help="這一題目前的分數會先暫存，最後按加入才會送出。"
+            help="這一題目前的分數會先暫存，最後按送出才會寫入。",
         )
 
-    action_col1, action_col2 = st.columns([1, 1])
+    action_col1, action_col2 = st.columns(2)
     with action_col1:
-        if st.button("加入這位朋友並分析", type="primary", use_container_width=True):
-            add_current_member()
+        if st.button("送出問卷並分析", type="primary", use_container_width=True):
+            submit_current_response(sheet)
     with action_col2:
         if st.button("清空這份問卷", use_container_width=True):
             st.session_state.reset_draft_pending = True
@@ -507,12 +590,12 @@ with tab1:
 
 with tab2:
     st.subheader("每位朋友的個人推薦結果")
-    if not st.session_state.members:
-        st.info("目前還沒有資料，請先到「新增朋友問卷」加入成員。")
+    if not members:
+        st.info("目前還沒有任何雲端填答資料，請先到「填寫問卷」送出至少 1 份問卷。")
     else:
-        member_names = [m["name"] for m in st.session_state.members]
-        selected_name = st.selectbox("選擇想查看的朋友", member_names)
-        member = next(m for m in st.session_state.members if m["name"] == selected_name)
+        member_labels = [f"{m['name']}｜{m['timestamp']}" for m in members]
+        selected_label = st.selectbox("選擇想查看的填答者", member_labels)
+        member = members[member_labels.index(selected_label)]
 
         c1, c2 = st.columns([1.1, 1.4])
         with c1:
@@ -529,13 +612,11 @@ with tab2:
         st.markdown("---")
         st.markdown("### 依第一名推薦地點動態生成兩天一夜行程")
         top_dest = member["recommendations"][0][0]
-
         seed = st.number_input("行程隨機種子（修改可得到不同版本）", min_value=1, max_value=9999, value=42, step=1)
         itinerary = build_dynamic_itinerary(member["profile"], top_dest, seed=seed)
 
         st.write(f"**推薦地點：{top_dest['name']}**")
         st.info(itinerary_comment(member["profile"], itinerary))
-
         for day, items in itinerary.items():
             st.markdown(f"#### {day}")
             for idx, item in enumerate(items, start=1):
@@ -543,9 +624,8 @@ with tab2:
 
 with tab3:
     st.subheader("全體朋友綜合分析")
-    members = st.session_state.members
     if not members:
-        st.info("請先至少加入 1 位朋友。")
+        st.info("請先至少送出 1 份問卷。")
     else:
         st.markdown("### 全體綜合前三推薦")
         group_top = group_recommendation(members, top_n=3)
@@ -555,10 +635,10 @@ with tab3:
 
         st.markdown("---")
         st.markdown("### 全體平均人格分數")
-        avg_profile = {}
-        for dim in DIMENSIONS:
-            avg_profile[dim] = round(sum(m["profile"][dim] for m in members) / len(members), 2)
-
+        avg_profile = {
+            dim: round(sum(m["profile"][dim] for m in members) / len(members), 2)
+            for dim in DIMENSIONS
+        }
         avg_df = radar_df(avg_profile)
         st.bar_chart(avg_df.set_index("構面"))
 
@@ -567,7 +647,6 @@ with tab3:
         group_itinerary = build_dynamic_itinerary(avg_profile, best_group_dest, seed=77)
         st.write(f"**綜合推薦地點：{best_group_dest['name']}**")
         st.info("這份行程是以全體平均偏好生成，並考慮成員之間的差異不要太大。")
-
         for day, items in group_itinerary.items():
             st.markdown(f"#### {day}")
             for idx, item in enumerate(items, start=1):
@@ -582,5 +661,5 @@ with tab3:
             label="下載分析結果 CSV",
             data=csv_data,
             file_name="travel_group_analysis.csv",
-            mime="text/csv"
+            mime="text/csv",
         )
